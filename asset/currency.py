@@ -1,8 +1,13 @@
 import abc
-import datetime
+
 import pandas as pd
 import numpy as np
+
 import requests
+
+import datetime
+from dateutil.relativedelta import relativedelta
+import re
 
 class Asset(metaclass=abc.ABCMeta):
     pass
@@ -10,54 +15,7 @@ class Asset(metaclass=abc.ABCMeta):
 class Currency(Asset, metaclass=abc.ABCMeta):
     
     transaction_schema = ['datetime', 'type', 'units', 'price', 'fee']
-    
-    def __repr__(self):
-        return f'{self.name} ({self.symbol})\nUnits: {self.units:.5f}\nTotal Profit: {round(self.total_profit, 2)}'
-    
-    @staticmethod
-    def price(fsym, tsym='cad', timestamp=datetime.datetime.now().timestamp()):
-        ''' str, str, float -> float
-        Return the currency conversion rate from `fsym` to `tsym` for the specified `timestamp`.
-
-        Data based on aggregated closing hourly price obtained from Cryptocompare.
-        '''
-        if fsym == tsym:
-            return 1.
-
-        payload = {
-            'tsym': tsym.upper(),
-            'fsym': fsym.upper(),
-            'toTs': int(timestamp)
-        }
-
-        # Obtain response
-        response = requests.get('https://min-api.cryptocompare.com/data/histohour', params=payload)
-
-        assert response.status_code == 200, 'Failed currency conversion query.'
-
-        return response.json()['Data'][-1]['close']
-    
-    def _add_transaction(self, transaction_type, units, price, fee, dt):
-        self.transactions = pd.concat([self.transactions, 
-                                       pd.DataFrame([(dt, transaction_type, units, price, fee)], 
-                                                    columns=Currency.transaction_schema)],
-                                      ignore_index=True,
-                                      verify_integrity=True)
-        
-    @staticmethod
-    def _filter_by_year(df, year, cumulative=True):
-        ''' df -> df
-        Return a filtered dataframe containing dates up to
-        `year`, if `cumulative` is True. Otherwise, filtered dataframe
-        contains entries only for that year. 
-        
-        Inputs:
-            df: A dataframe containing 'date' series of datetime objects
-        '''
-        if cumulative:
-            return df[df['datetime'].apply(lambda date: date.year) <= year]
-        
-        return df[df['datetime'].apply(lambda date: date.year) == year]
+    transaction_types = ['fund', 'buy', 'comm', 'fee', 'sell', 'transfer']
     
     def __init__(self, name, symbol):
         self.name = name
@@ -66,6 +24,9 @@ class Currency(Asset, metaclass=abc.ABCMeta):
         self.total_profit = 0.
         self.current_acb = 0.
         self.transactions = pd.DataFrame()
+
+    def __repr__(self):
+        return f'{self.name} ({self.symbol})\nUnits: {self.units:.5f}\nTotal Profit: {round(self.total_profit, 2)}'
         
     def worth(self, fiat='cad'):
         ''' None -> float
@@ -143,20 +104,18 @@ class Currency(Asset, metaclass=abc.ABCMeta):
         # Add transaction
         self._add_transaction(transaction_type='comm', 
                               fee=0., 
-                              price=np.nan,
+                              price=Currency.price(self.symbol, timestamp=dt.timestamp()),
                               units=units,
                               dt=dt)
         
-    def acb(self, year=None):
+    def acb(self, dt=datetime.datetime.now()):
         ''' int -> float
-        Calculate the Average Cost Basis (ACB) at a given `year` end. 
-        
-        If `year` is None, provides latest ACB.
+        Calculate the Average Cost Basis (ACB) for a given `dt`. 
         '''
         # Obtain relevant transactions
-        df = Crypto._filter_by_year(self.transactions, 
-                                    year=datetime.datetime.now().year if year is None else year,
-                                    cumulative=True)
+        df = Currency._filter_transaction(self.transactions, 
+                                          start=self.transactions.loc[0, 'datetime'],
+                                          end=dt)
         
         # Calculate ACB
         _acb = 0.
@@ -171,35 +130,46 @@ class Currency(Asset, metaclass=abc.ABCMeta):
                 
         return _acb
     
-    def fee(self, year=None):
+    def fee(self, start, end, year=None):
         ''' int -> float
-        Calculate the fees accumulated during a given `year`. 
+        Calculate the fees accumulated between `start` and `end` (inclusive). 
         
-        If `year` is None, provides total fee.
+        If `year` is not None, provide fees accumulated for that year. 
         '''
         # Obtain relevant transactions
-        return (Crypto
-                ._filter_by_year(self.transactions, 
-                                 year=datetime.datetime.now().year if year is None else year,
-                                 cumulative=False)['fee']
+        if year is not None and isinstance(year, int):
+            start = datetime.datetime(year, 1, 1)
+            end = datetime.datetime(year, 12, 31)
+
+        return (Currency
+                ._filter_transaction(self.transactions, 
+                                     start=datetime.datetime(dt.year, 1, 1),
+                                     end=dt)['fee']
                 .sum())
     
-    def profit(self, year=None):
-        ''' int -> float
-        Calculate the profits for a given `year`. 
-        
-        If `year` is None, provides total profits.
+    def profit(self, start, end, year=None):
+        ''' datetime, datetime -> float
+        Calculate the profits for from `start` to `end` (inclusive). 
+
+        If year is provided, profit is calculated for that year. 
         '''
-        if year is None:
+        assert start <= end, 'start should precede end.'
+
+        # If year is provided, set `start` and `end` to first and last day of the year.
+        if year is not None and isinstance(year, int):
+            start = datetime.datetime(year, 1, 1)
+            end = datetime.datetime(year, 12, 31)
+
+        if start == self.transactions.loc[0, 'datetime'] and end >= self.transactions.loc[len(self.transactions) - 1, 'datetime']:
             return self.total_profit
         
         # Obtain relevant transactions
-        df = Crypto._filter_by_year(self.transactions, year=year, cumulative=False)
+        df = Currency._filter_transaction(self.transactions, start=start, end=end)
         
-        # Initalise values
-        _acb = self.acb(year - 1)
+        # Initialise values
+        _acb = self.acb(start - datetime.timedelta(days=-1))
         _profit = 0.
-        _units = self._units(year - 1)
+        _units = self._units(start - datetime.timedelta(days=-1))
         _epsilon = 1e-6
         
         # Calculate profit
@@ -223,17 +193,15 @@ class Currency(Asset, metaclass=abc.ABCMeta):
                 
         return _profit 
     
-    def _units(self, year=None):
+    def _units(self, dt=datetime.datetime.now()):
         ''' int -> float
-        Calculate the units at the end of a given `year`. 
-        
-        If `year` is None, return current units.
+        Calculate the units at the end of a given datetime `dt`. 
         '''
-        if year is None:
-            return self.units
         
         # Obtain relevant transactions
-        df = Crypto._filter_by_year(self.transactions, year=year, cumulative=True)
+        df = Currency._filter_transaction(self.transactions, 
+                                          start=self.transactions.loc[0, 'datetime'],
+                                          end=dt)
         
         # Calculate units
         _units = 0.
@@ -245,6 +213,58 @@ class Currency(Asset, metaclass=abc.ABCMeta):
                 _units -= row['units']
                 
         return _units
+
+    @staticmethod
+    def price(fsym, tsym='cad', timestamp=datetime.datetime.now().timestamp()):
+        ''' str, str, float -> float
+        Return the currency conversion rate from `fsym` to `tsym` for the specified `timestamp`.
+
+        Data based on aggregated closing hourly price obtained from Cryptocompare.
+        '''
+        if fsym == tsym:
+            return 1.
+
+        payload = {
+            'tsym': tsym.upper(),
+            'fsym': fsym.upper(),
+            'toTs': int(timestamp)
+        }
+
+        # Obtain response
+        response = requests.get('https://min-api.cryptocompare.com/data/histohour', params=payload)
+
+        assert response.status_code == 200, 'Failed currency conversion query.'
+
+        return response.json()['Data'][-1]['close']
+    
+
+    ## Private methods for handling transactions
+    def _add_transaction(self, transaction_type, units, price, fee, dt):
+        self.transactions = pd.concat([self.transactions, 
+                                       pd.DataFrame([(dt, transaction_type, units, price, fee)], 
+                                                    columns=Currency.transaction_schema)],
+                                      ignore_index=True,
+                                      verify_integrity=True)
+        
+    @staticmethod
+    def _filter_transaction(df, start, end=datetime.datetime.now(), freq=None):
+        ''' df, datetime, datetime, str -> df
+        Return a filtered dataframe containing dates from `start` to `end` (inclusive),
+        grouped in time frequency `freq`.
+        
+        Inputs:
+            df: A dataframe containing 'date' series of datetime objects
+        '''
+        # Filter transactions
+        df = df[(df['datetime'] >= start) & (df['datetime'] <= end)]
+
+        if freq is not None:
+            df = (df
+                  .groupby([pd.Grouper(key='datetime', freq=freq), 'type'])
+                  .sum()
+                  .reset_index())
+
+        return df
     
 class Crypto(Currency):
     def price(self, fiat='cad'):
